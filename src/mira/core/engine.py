@@ -17,7 +17,10 @@ from mira.core.priority import rank_files
 from mira.exceptions import ResponseParseError
 from mira.index.context import build_code_context
 from mira.index.store import IndexStore
-from mira.llm.prompts.review import build_review_prompt, build_walkthrough_prompt
+from mira.llm.prompts.review import (
+    build_review_prompt,
+    build_walkthrough_prompt,
+)
 from mira.llm.prompts.verify_fixes import build_verify_fixes_prompt, parse_verify_fixes_response
 from mira.llm.provider import LLMProvider
 from mira.llm.response_parser import (
@@ -90,6 +93,81 @@ def _clamp_confidence_to_findings(
 
 _MAX_FULL_FILE_LINES = 500
 _LARGE_FILE_CONTEXT_LINES = 50  # ±50 lines = 100-line window
+
+
+# Path patterns where security findings are extremely unlikely. Used to
+# narrow the dedicated security pass — see _security_review_pass. We keep
+# this conservative: every excluded category is "shouldn't house auth /
+# crypto / origin / injection logic." When uncertain, keep the file.
+_SECURITY_PASS_SKIP_PATTERNS = (
+    # DB migrations: schema changes, indexes — no request handling.
+    "db/migrate/",
+    "/migrations/",
+    # Tests: assertions about behavior, not the behavior itself.
+    "spec/",
+    "/__tests__/",
+    "/__fixtures__/",
+    "/fixtures/",
+    # Docs and changelogs.
+    ".md",
+    ".rst",
+    ".txt",
+    "CHANGELOG",
+    "LICENSE",
+    # Pure styles: extremely rare attack surface; XSS through CSS would
+    # show up in the embedded JS or template, not the .scss.
+    ".css",
+    ".scss",
+    ".less",
+    ".sass",
+    # Lockfiles: package manager output, not application code.
+    ".lock",
+    "package-lock.json",
+    "yarn.lock",
+    "Pipfile.lock",
+    # Common build / vendor output, in case file_filter let it through.
+    "/dist/",
+    "/build/",
+    "/vendor/",
+    "/node_modules/",
+)
+
+_SECURITY_TEST_SUFFIXES = (
+    "_test.go",
+    "_test.py",
+    "_spec.rb",
+    "_spec.js",
+    "_spec.ts",
+    ".test.js",
+    ".test.jsx",
+    ".test.ts",
+    ".test.tsx",
+    ".spec.js",
+    ".spec.jsx",
+    ".spec.ts",
+    ".spec.tsx",
+)
+
+
+def _security_relevant_files(files: list) -> list:
+    """Return the subset of files plausibly containing security findings.
+
+    The dedicated security pass runs as one LLM call across the entire
+    diff. When the diff is dominated by migrations / specs / lockfiles,
+    those non-code files dilute attention away from the actual vulnerable
+    code. This filter trims the obvious-no-finding cases so the model can
+    focus.
+    """
+    keep = []
+    for f in files:
+        path = f.path
+        lower = path.lower()
+        if any(p in lower for p in _SECURITY_PASS_SKIP_PATTERNS):
+            continue
+        if any(lower.endswith(s) for s in _SECURITY_TEST_SUFFIXES):
+            continue
+        keep.append(f)
+    return keep
 
 
 def _select_files_by_priority(
@@ -249,6 +327,17 @@ class ReviewEngine:
         self.provider = provider
         self.bot_name = bot_name
         self.dry_run = dry_run
+        # Set during _build_context: True when the repo has no prior index,
+        # so cross-file context came from JIT lookup (less complete than
+        # a full pre-built index). Drives the walkthrough nudge that tells
+        # the user reviews will be more accurate after indexing.
+        self._index_was_empty = False
+        # Captured during _build_context for the agentic tool-use path: a
+        # source fetcher and the repo tree at PR head. Both already needed
+        # for JIT, so reusing them is free. None when no provider/PR is
+        # attached (CLI / dry-run).
+        self._agentic_source_fetcher: object | None = None
+        self._agentic_repo_tree: list[str] = []
 
     async def _post_placeholder_comment(self, pr_info: PRInfo) -> int | None:
         """Post an immediate 'Reviewing this PR...' comment and return its ID.
@@ -361,6 +450,52 @@ class ReviewEngine:
         except Exception as exc:
             logger.warning("Failed to compute review round: %s", exc)
 
+        # Incremental diff for round 2+: if we have a stored last-reviewed
+        # SHA, fetch only what's been pushed since then. This prevents the
+        # bot from "discovering" issues in untouched files between rounds —
+        # which feels to authors like the bot withheld findings on round 1.
+        # Falls back silently to the full diff if anything goes wrong.
+        if review_round >= 2 and pr_info.head_sha:
+            try:
+                from mira.dashboard.api import _app_db
+
+                last_sha = _app_db.get_last_reviewed_sha(
+                    pr_info.owner,
+                    pr_info.repo,
+                    pr_info.number,
+                )
+                if last_sha and last_sha != pr_info.head_sha:
+                    incremental = await self.provider.get_compare_diff(
+                        pr_info,
+                        last_sha,
+                        pr_info.head_sha,
+                    )
+                    if incremental.strip():
+                        logger.info(
+                            "Round %d incremental diff %s..%s on PR %s (was %d chars, now %d)",
+                            review_round,
+                            last_sha[:8],
+                            pr_info.head_sha[:8],
+                            pr_info.url,
+                            len(diff_text),
+                            len(incremental),
+                        )
+                        diff_text = incremental
+                    else:
+                        # Same head SHA or empty diff — nothing new to review.
+                        logger.info(
+                            "Round %d: no new commits since %s on PR %s, skipping review",
+                            review_round,
+                            last_sha[:8],
+                            pr_info.url,
+                        )
+                        diff_text = ""
+            except Exception as exc:
+                logger.warning(
+                    "Incremental diff fetch failed, falling back to full diff: %s",
+                    exc,
+                )
+
         # Pull the team conventions text the indexer extracted from
         # CONTRIBUTING.md / AGENTS.md / STYLE.md so the LLM knows
         # repo-specific style rules.
@@ -430,6 +565,8 @@ class ReviewEngine:
                     except Exception:
                         pass
 
+                    import os as _os
+
                     markdown = result.walkthrough.to_markdown(
                         bot_name=self.bot_name,
                         review_stats=stats,
@@ -440,6 +577,8 @@ class ReviewEngine:
                         key_issues=result.key_issues or None,
                         skipped_paths=result.skipped_paths or None,
                         total_paths=result.total_paths or None,
+                        index_was_empty=getattr(self, "_index_was_empty", False),
+                        dashboard_url=_os.environ.get("MIRA_DASHBOARD_URL", ""),
                     )
                     # Prefer the known placeholder ID. Fall back to marker-based
                     # lookup if the placeholder never posted (network blip, etc.).
@@ -547,6 +686,23 @@ class ReviewEngine:
         except Exception as exc:
             logger.debug("Failed to record review event: %s", exc)
 
+        # Always anchor the SHA after a successful review — including rounds
+        # that found zero comments. Otherwise round 2 has no SHA to diff
+        # against and falls back to a full review, which is the bug we're
+        # trying to avoid.
+        if pr_info.head_sha:
+            try:
+                from mira.dashboard.api import _app_db
+
+                _app_db.set_last_reviewed_sha(
+                    pr_info.owner,
+                    pr_info.repo,
+                    pr_info.number,
+                    pr_info.head_sha,
+                )
+            except Exception as exc:
+                logger.debug("Failed to record last reviewed SHA: %s", exc)
+
         return result
 
     async def review_diff(self, diff_text: str) -> ReviewResult:
@@ -653,8 +809,9 @@ class ReviewEngine:
                         source_fetcher = ProviderSourceFetcher(
                             self.provider, pr_info, pr_info.head_branch
                         )
+                    changed_paths = [f.path for f in filtered]
                     ctx = await build_code_context(
-                        changed_paths=[f.path for f in filtered],
+                        changed_paths=changed_paths,
                         store=store,
                         token_budget=self.config.review.context_token_budget,
                         source_fetcher=source_fetcher,
@@ -662,6 +819,50 @@ class ReviewEngine:
                     doc_context = store.get_all_review_context_text()
                     if doc_context:
                         ctx = ctx + "\n\n" + doc_context
+
+                    # Detect "empty index" — no summaries for any changed file
+                    # means the indexer hasn't run for this repo. Fall back to
+                    # JIT cross-file lookup: parse imports in the changed
+                    # files, fetch the imported files from HEAD, extract their
+                    # symbols, and inline. Works without a pre-built index.
+                    index_has_data = bool(store.get_summaries(changed_paths))
+                    self._index_was_empty = not index_has_data
+                    if not index_has_data and source_fetcher is not None:
+                        try:
+                            from mira.index.jit_context import (
+                                build_jit_cross_file_context,
+                            )
+
+                            tree_paths: set[str] | None = None
+                            if hasattr(self.provider, "get_repo_tree"):
+                                try:
+                                    tree_paths = set(
+                                        await self.provider.get_repo_tree(
+                                            pr_info,
+                                            pr_info.head_branch,
+                                        )
+                                    )
+                                except Exception as exc:
+                                    logger.debug(
+                                        "JIT: tree fetch failed: %s",
+                                        exc,
+                                    )
+                            # Stash for the agentic tool-use path so
+                            # _review_chunk can give the LLM read_file /
+                            # grep_repo without re-fetching the tree.
+                            self._agentic_source_fetcher = source_fetcher
+                            self._agentic_repo_tree = sorted(tree_paths) if tree_paths else []
+                            jit = await build_jit_cross_file_context(
+                                changed_files=filtered,
+                                source_fetcher=source_fetcher,
+                                repo_tree=tree_paths,
+                                char_budget=(self.config.review.context_token_budget * 4),
+                                enable_java_go=self.config.review.jit_java_go,
+                            )
+                            if jit:
+                                ctx = ctx + "\n\n" + jit
+                        except Exception as exc:
+                            logger.debug("JIT context build failed: %s", exc)
 
                     # Append cross-repo impact so inline reviews know about
                     # other repositories that depend on the changed code.
@@ -816,7 +1017,26 @@ class ReviewEngine:
                         resolved_threads=resolved_threads,
                         team_conventions=team_conventions,
                     )
-                    raw_response = await self.llm.review(messages)
+                    raw_response = ""
+                    # Agentic tool-use path: only on unindexed repos, where
+                    # the static context block is necessarily thin. Indexed
+                    # reviews already have the full picture, so the extra
+                    # hops would just slow things down.
+                    use_agentic = (
+                        self.config.review.agentic_tools
+                        and getattr(self, "_index_was_empty", False)
+                        and self._agentic_source_fetcher is not None
+                    )
+                    if use_agentic:
+                        from mira.llm.agentic_tools import AgenticToolExecutor
+
+                        executor = AgenticToolExecutor(
+                            source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
+                            repo_tree=list(self._agentic_repo_tree),
+                        )
+                        raw_response = await self._agentic_review_loop(messages, executor)
+                    if not raw_response:
+                        raw_response = await self.llm.review(messages)
                     parsed = parse_llm_response(raw_response)
                     comments = convert_to_review_comments(
                         parsed,
@@ -837,7 +1057,17 @@ class ReviewEngine:
                     )
                     return [], [], ""
 
-        chunk_results = await _asyncio.gather(*[_review_chunk(i, c) for i, c in enumerate(chunks)])
+        # Run the main chunked review and the security pass in parallel.
+        # Security findings get merged into all_comments and go through the
+        # same noise filter (dedup catches any overlap with main-pass
+        # findings on the same line).
+        review_task = _asyncio.gather(*[_review_chunk(i, c) for i, c in enumerate(chunks)])
+        security_task = _asyncio.create_task(
+            self._security_review_pass(filtered, pr_title)
+            if self.config.review.security_pass
+            else _asyncio.sleep(0, result=[])
+        )
+        chunk_results, security_comments = await _asyncio.gather(review_task, security_task)
 
         all_comments: list[ReviewComment] = []
         all_key_issues: list[KeyIssue] = []
@@ -847,6 +1077,7 @@ class ReviewEngine:
             all_key_issues.extend(key_issues)
             if summary_text:
                 summaries.append(summary_text)
+        all_comments.extend(security_comments)
 
         # Classify severity
         all_comments = [classify_severity(c) for c in all_comments]
@@ -861,8 +1092,7 @@ class ReviewEngine:
         # Self-critique pass — re-verify each draft comment before posting.
         # Catches confident-but-wrong claims (the LLM's own analysis errors)
         # that the noise filter can't catch because confidence scores are
-        # also LLM-generated. Uses the cheap indexing-tier model so the
-        # added cost is ~$0.001 per review.
+        # also LLM-generated. Runs on the configured indexing model.
         if final_comments and self.config.review.self_critique:
             try:
                 final_comments = await self._self_critique(final_comments)
@@ -907,6 +1137,203 @@ class ReviewEngine:
             total_paths=all_paths,
         )
 
+    async def _agentic_review_loop(
+        self,
+        messages: list[dict],
+        executor: object,
+    ) -> str:
+        """Run an agentic tool-use loop until the LLM submits a review.
+
+        Hands the model `read_file` and `grep_repo` alongside the terminal
+        `submit_review` tool. Each hop: call the model, dispatch any
+        non-terminal tool calls, append results, repeat. Caps at 6 hops so
+        a confused model can't burn unbounded tokens.
+
+        Returns the JSON args of the final `submit_review` call (same
+        shape `self.llm.review` returns), or "" if the loop exited without
+        one — caller falls back to a forced single-tool call.
+        """
+        import json as _json
+
+        from mira.llm.agentic_tools import AGENTIC_TOOLS
+        from mira.llm.provider import SUBMIT_REVIEW_TOOL
+
+        tools = [*AGENTIC_TOOLS, SUBMIT_REVIEW_TOOL]
+        # Augment the existing system message with a brief note on tool use.
+        # Putting it inline keeps prompt structure intact for the rest of
+        # the flow (parsing, summary regen, etc.).
+        convo: list[dict] = [dict(m) for m in messages]
+        if convo and convo[0].get("role") == "system":
+            convo[0]["content"] = (
+                convo[0]["content"] + "\n\n## Tools\n\n"
+                "This repo isn't indexed, so you have two helpers for "
+                "cross-file checks: `read_file(path)` and "
+                "`grep_repo(pattern, path_glob?, path_only?)`. Use them when, "
+                "and ONLY when, you need to verify a cross-file claim before "
+                "filing a comment (e.g. *does the called function actually "
+                "raise X?*, *is this symbol defined elsewhere?*). Don't browse — "
+                "fetch what you specifically need. Skip the tools entirely if "
+                "the diff alone is enough. Once you're ready, call "
+                "`submit_review` with all your findings."
+            )
+
+        max_hops = 6
+        for hop in range(max_hops):
+            try:
+                msg = await self.llm.complete_agentic(convo, tools=tools)
+            except Exception as exc:
+                logger.warning("Agentic hop %d failed: %s", hop + 1, exc)
+                return ""
+
+            tool_calls = msg.get("tool_calls") or []
+            content = msg.get("content") or ""
+
+            if not tool_calls:
+                # The model ended without calling submit_review — fall back.
+                logger.debug(
+                    "Agentic loop exited at hop %d without submit_review (content=%d chars)",
+                    hop + 1,
+                    len(content),
+                )
+                return ""
+
+            # Append the assistant message verbatim so tool_call_ids resolve.
+            convo.append(
+                {
+                    "role": "assistant",
+                    "content": content,
+                    "tool_calls": tool_calls,
+                }
+            )
+
+            for call in tool_calls:
+                fn = call.get("function") or {}
+                name = fn.get("name") or ""
+                if name == "submit_review":
+                    return fn.get("arguments") or ""
+
+                raw_args = fn.get("arguments") or "{}"
+                try:
+                    args = _json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+                except Exception:
+                    args = {}
+
+                tool_result = await executor.execute(name, args)  # type: ignore[attr-defined]
+                convo.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id") or "",
+                        "content": tool_result,
+                    }
+                )
+
+        logger.debug("Agentic loop hit %d-hop cap without submit_review", max_hops)
+        return ""
+
+    async def _security_review_pass(
+        self,
+        files: list,
+        pr_title: str = "",
+    ) -> list[ReviewComment]:
+        """Dedicated security review on the configured indexing model.
+
+        Runs in parallel with the main review. The output is a list of
+        ``ReviewComment`` to merge into ``all_comments`` before noise
+        filtering — overlapping findings dedupe naturally.
+
+        Routed through the indexing tier (typically a smaller, cheaper
+        model) because security findings here are mostly pattern-shaped
+        — XSS, injection, hard-coded secrets, missing CSRF — and don't
+        need the deeper reasoning the main pass does. Defense-in-depth:
+        the main pass on the review tier still catches the chained-
+        inference security bugs. Users who want the heavy model on
+        every pass can set ``llm.indexing_model`` to the same model as
+        ``llm.review_model``.
+
+        Returns ``[]`` and logs (debug) on any failure so a transient
+        LLM/API error doesn't kill the main review.
+        """
+        if not files:
+            return []
+
+        # Narrow input to files where security findings are plausible.
+        # On large diffs, migrations / lockfiles / fixtures / tests drown
+        # out the actual vulnerable code. With them in the prompt the model
+        # can miss explicit patterns (`X-Frame-Options: "ALLOWALL"`) that
+        # the prompt's category list calls out by name.
+        narrowed = _security_relevant_files(files)
+        if not narrowed:
+            # All files were filtered out — fall back to the original set
+            # rather than skip the pass entirely. A PR that's purely
+            # migrations / specs CAN still introduce auth/permission bugs.
+            narrowed = files
+
+        from mira.config import load_config
+        from mira.dashboard.models_config import llm_config_for
+        from mira.llm.prompts.review import build_security_review_prompt
+        from mira.llm.provider import SUBMIT_REVIEW_TOOL, LLMProvider
+
+        # Build a security LLM on the indexing tier. If the config is
+        # missing the indexing model (or load_config raises in some
+        # exotic test setup), fall back to the main LLM rather than
+        # skip the pass entirely.
+        try:
+            base_config = load_config()
+            security_llm = LLMProvider(llm_config_for("indexing", base_config.llm))
+        except Exception:
+            security_llm = self.llm
+
+        messages = build_security_review_prompt(files=narrowed, pr_title=pr_title)
+        try:
+            raw = await security_llm.complete_with_tools(
+                messages=messages,
+                tools=[SUBMIT_REVIEW_TOOL],
+                temperature=0.0,
+            )
+        except Exception as exc:
+            # The indexing-tier model can fail at call time even when
+            # construction succeeded (missing API key, model not routable
+            # by the provider, etc.). Retry on the main LLM rather than
+            # silently dropping the whole security pass — paying review-
+            # tier cost on this PR is the right tradeoff vs losing the
+            # findings.
+            if security_llm is not self.llm:
+                logger.debug(
+                    "Security pass on indexing tier failed (%s); retrying on review LLM",
+                    exc,
+                )
+                try:
+                    raw = await self.llm.complete_with_tools(
+                        messages=messages,
+                        tools=[SUBMIT_REVIEW_TOOL],
+                        temperature=0.0,
+                    )
+                except Exception as exc2:
+                    logger.warning("Security review pass failed: %s", exc2)
+                    return []
+            else:
+                logger.warning("Security review pass failed: %s", exc)
+                return []
+
+        try:
+            parsed = parse_llm_response(raw)
+            comments = convert_to_review_comments(parsed, diff_files=files)
+        except ResponseParseError as exc:
+            logger.warning("Security review pass parse error: %s", exc)
+            return []
+        except Exception as exc:
+            logger.warning("Security review pass conversion failed: %s", exc)
+            return []
+
+        # Force category=security so the badge renders correctly even if the
+        # LLM put something else.
+        for c in comments:
+            if not c.category or c.category != "security":
+                c.category = "security"
+        if comments:
+            logger.info("Security pass produced %d candidate comment(s)", len(comments))
+        return comments
+
     async def _self_critique(self, comments: list[ReviewComment]) -> list[ReviewComment]:
         """Run a second-pass critique on each draft comment.
 
@@ -914,9 +1341,9 @@ class ReviewEngine:
         prove this is a real, actionable issue?* Comments without verifiable
         citations or with confidently-wrong analysis get dropped.
 
-        Uses the cheap indexing-tier model (Haiku-class) — the critic is a
-        verification step, not a generation step. Returns the kept comments
-        in their original order.
+        Uses the configured indexing model — the critic is a verification
+        step, not a generation step. Returns the kept comments in their
+        original order.
         """
         import json as _json
 
@@ -940,6 +1367,7 @@ class ReviewEngine:
                 f"    Body:  {(c.body or '').strip()[:500]}\n"
                 f"    Cites: {cited or '(no code citation)'}\n"
             )
+
         critic_prompt = (
             "You are reviewing draft PR comments produced by another reviewer. "
             "Your job is to filter out confidently-wrong analyses, speculation, "
@@ -958,7 +1386,7 @@ class ReviewEngine:
             "## Draft comments\n\n" + "\n".join(draft_lines)
         )
 
-        # Use the indexing-tier (cheap) model — critique is a verification
+        # Use the configured indexing model — critique is a verification
         # task, not generation. Falls back to the review model if no
         # indexing model is configured.
         try:
@@ -1011,8 +1439,8 @@ class ReviewEngine:
         mention issues that never got filed (LLM put them in prose only) or
         that were later dropped by noise filter / self-critique / orphan
         filter. Regenerate from the surviving structured outputs using the
-        cheap indexing-tier model so the prose can't lie about what's in the
-        Key Issues table or the inline comments.
+        configured indexing model so the prose stays grounded in the Key
+        Issues table and inline comments that actually shipped.
         """
         if not comments and not key_issues:
             return "No issues found."

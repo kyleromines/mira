@@ -183,6 +183,7 @@ class GitHubProvider(BaseProvider):
                 number=pr.number,
                 owner=owner,
                 repo=repo,
+                head_sha=pr.head.sha or "",
             )
 
         try:
@@ -213,6 +214,44 @@ class GitHubProvider(BaseProvider):
         except Exception as e:
             raise ProviderError(f"Failed to fetch PR diff: {e}") from e
 
+    async def get_compare_diff(
+        self,
+        pr_info: PRInfo,
+        base_sha: str,
+        head_sha: str,
+    ) -> str:
+        """Fetch a unified diff between two commits via GitHub's compare API.
+
+        Used by round 2+ reviews so we only review what's been pushed since
+        the last review (``last_reviewed_sha``..``current_head_sha``) rather
+        than re-flagging every file in the PR.
+
+        Returns an empty string if the two SHAs are identical (nothing new
+        to review).
+        """
+        if base_sha == head_sha or not base_sha or not head_sha:
+            return ""
+        url = (
+            f"{_GITHUB_API_URL}/repos/{pr_info.owner}/{pr_info.repo}"
+            f"/compare/{base_sha}...{head_sha}"
+        )
+        headers = {
+            "Authorization": f"token {self._token}",
+            "Accept": "application/vnd.github.v3.diff",
+        }
+
+        @_retry_transient
+        async def _fetch() -> str:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, headers=headers, follow_redirects=True)
+                resp.raise_for_status()
+                return resp.text
+
+        try:
+            return await _fetch()
+        except Exception as e:
+            raise ProviderError(f"Failed to fetch compare diff: {e}") from e
+
     async def post_review(
         self,
         pr_info: PRInfo,
@@ -222,7 +261,7 @@ class GitHubProvider(BaseProvider):
         if not result.comments:
             return
 
-        # Build inline comments (no retry needed for local formatting)
+        # Build inline comments (no retry needed for local formatting).
         review_comments: list[dict[str, str | int]] = []
         for comment in result.comments:
             body = _format_comment_body(comment, bot_name=bot_name)
@@ -272,36 +311,70 @@ class GitHubProvider(BaseProvider):
                     exc.data,
                 )
 
-            # Fallback: post each comment individually so one bad line
-            # doesn't kill all comments.
+            # Fallback: post each comment individually via the standalone
+            # /comments endpoint (``create_review_comment``) rather than
+            # wrapping each in another /reviews call. The /reviews endpoint
+            # has stricter atomicity validation that returns vague 422s
+            # for some valid-looking requests; /comments accepts the same
+            # request shape with more lenient checking. We accept the
+            # tradeoff that the inlines aren't grouped under a single
+            # "review" object — they still appear as inline comments on
+            # the PR, which is what the user actually sees.
+            #
+            # We log the *full* 422 body for each skipped comment rather
+            # than assuming "line not in diff" — GitHub also returns 422
+            # with vague "internal error" bodies for things like stale
+            # commit refs and validation hiccups, and conflating those
+            # with line-mismatch loses important diagnostic info.
             posted = 0
             for rc in review_comments:
                 try:
-                    pr.create_review(
-                        commit=latest_commit,
-                        body="",
-                        event="COMMENT",
-                        comments=[rc],  # type: ignore[arg-type]
+                    kwargs: dict = {
+                        "body": rc["body"],
+                        "commit": latest_commit,
+                        "path": rc["path"],
+                    }
+                    if "line" in rc:
+                        kwargs["line"] = rc["line"]
+                    if "start_line" in rc:
+                        kwargs["start_line"] = rc["start_line"]
+                    logger.info(
+                        "POST /comments commit=%s path=%s line=%s body_len=%d",
+                        getattr(latest_commit, "sha", "?")[:8],
+                        kwargs.get("path"),
+                        kwargs.get("line"),
+                        len(kwargs.get("body", "")),
                     )
+                    pr.create_review_comment(**kwargs)
                     posted += 1
                 except GithubException as exc:
                     if exc.status == 422:
                         logger.warning(
-                            "Skipping comment on %s:%s — line not in diff",
+                            "Skipping comment on %s:%s — 422 from GitHub: %s",
                             rc.get("path"),
                             rc.get("line"),
+                            exc.data,
                         )
                     else:
                         raise
 
+            # Always make sure SOMETHING posts. If every inline failed,
+            # post the summary + Key Issues table on its own so the user
+            # at least sees the review existed.
             if posted == 0 and review_body:
-                # All inline comments failed but we still have a summary
-                pr.create_review(
-                    commit=latest_commit,
-                    body=review_body,
-                    event="COMMENT",
-                    comments=[],
-                )
+                try:
+                    pr.create_review(
+                        commit=latest_commit,
+                        body=review_body,
+                        event="COMMENT",
+                        comments=[],
+                    )
+                except GithubException as exc:
+                    logger.warning(
+                        "Summary-only fallback also failed (%s): %s",
+                        exc.status,
+                        exc.data,
+                    )
 
             logger.info("Individual fallback: posted %d/%d comments", posted, len(review_comments))
 
@@ -407,7 +480,7 @@ class GitHubProvider(BaseProvider):
     async def resolve_outdated_review_threads(self, pr_info: PRInfo) -> int:
         @_retry_transient
         async def _resolve() -> int:
-            # Phase 1: Paginate through review threads and collect bot-authored
+            # Step 1: Paginate through review threads and collect bot-authored
             # unresolved threads that GitHub has marked as outdated.
             bot_login: str | None = None
             thread_ids: list[str] = []
@@ -454,7 +527,7 @@ class GitHubProvider(BaseProvider):
                 len(thread_ids),
             )
 
-            # Phase 2: Resolve each collected outdated thread
+            # Step 2: Resolve each collected outdated thread
             for thread_id in thread_ids:
                 await self._graphql_request(_RESOLVE_THREAD_MUTATION, {"threadId": thread_id})
 
@@ -590,6 +663,34 @@ class GitHubProvider(BaseProvider):
             raise
         except Exception as e:
             raise ProviderError(f"Failed to remove label: {e}") from e
+
+    async def get_repo_tree(self, pr_info: PRInfo, ref: str) -> list[str]:
+        """List every blob (file) path in the repo at a given ref.
+
+        Used by JIT cross-file context: we fetch the tree once, then
+        check which import-resolution candidates actually exist before
+        spending API calls fetching their contents. One API call → up to
+        thousands of paths in response.
+        """
+        url = f"{_GITHUB_API_URL}/repos/{pr_info.owner}/{pr_info.repo}/git/trees/{ref}?recursive=1"
+        headers = {
+            "Authorization": f"token {self._token}",
+            "Accept": "application/vnd.github+json",
+        }
+
+        @_retry_transient
+        async def _fetch() -> list[str]:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(url, headers=headers, follow_redirects=True)
+                resp.raise_for_status()
+                data = resp.json()
+            return [item["path"] for item in data.get("tree", []) if item.get("type") == "blob"]
+
+        try:
+            return await _fetch()
+        except Exception as exc:
+            logger.debug("Failed to fetch repo tree: %s", exc)
+            return []
 
     async def get_file_content(self, pr_info: PRInfo, path: str, ref: str) -> str:
         """Fetch file content at a specific ref via the REST API."""
@@ -1025,6 +1126,28 @@ def _format_comment_body(comment: ReviewComment, bot_name: str = "miracodeai") -
             clean = _html_mod.unescape(comment.suggestion)
             prompt_text += f"\n\nApply this code change:\n\n{clean}"
 
+        # Use a markdown fence inside the ``<details>`` block (not
+        # ``<pre>``). GitHub's review-comment endpoint silently rejects
+        # comment bodies containing certain raw-HTML constructs — a
+        # ``<pre>{escaped}</pre>`` block on PR#41 produced 422 "internal
+        # error" responses with no useful diagnostics. The format that
+        # actually posts (and was used successfully on PR#40 et al.) is
+        # a fenced code block with blank lines separating it from the
+        # surrounding ``<details>`` HTML, so GitHub parses the inner
+        # text as markdown rather than raw HTML. _html_mod stays
+        # imported above for parity with the previous unescape on
+        # ``comment.suggestion`` if it ever needs to grow.
+        max_run = 0
+        run = 0
+        for ch in prompt_text:
+            if ch == "`":
+                run += 1
+                if run > max_run:
+                    max_run = run
+            else:
+                run = 0
+        fence = "`" * max(3, max_run + 1)
+
         parts.append("")
         parts.append("---")
         parts.append("")
@@ -1032,10 +1155,11 @@ def _format_comment_body(comment: ReviewComment, bot_name: str = "miracodeai") -
             "<details>\n"
             "<summary>Prompt for AI Agents</summary>\n"
             "\n"
-            f"<pre>{_html_mod.escape(prompt_text)}</pre>\n"
+            f"{fence}\n{prompt_text}\n{fence}\n"
             "\n"
             "</details>"
         )
+        _ = _html_mod  # imported for backward-compat with suggestion path
 
     parts.append("")
     parts.append(f"> Not useful? Reply `@{bot_name} reject` to dismiss this suggestion.")

@@ -13,9 +13,12 @@ from mira.core.engine import (
     _clamp_confidence_to_findings,
     _drop_orphan_key_issues,
     _extract_sections,
+    _security_relevant_files,
 )
 from mira.llm.provider import LLMProvider
 from mira.models import (
+    FileChangeType,
+    FileDiff,
     KeyIssue,
     PRInfo,
     ReviewComment,
@@ -24,6 +27,60 @@ from mira.models import (
     WalkthroughConfidenceScore,
     WalkthroughResult,
 )
+
+
+def _empty_filediff(path: str) -> FileDiff:
+    return FileDiff(
+        path=path,
+        change_type=FileChangeType.MODIFIED,
+        language="",
+        added_lines=0,
+        deleted_lines=0,
+        hunks=[],
+    )
+
+
+class TestSecurityFileFilter:
+    """The security pass narrows its input so the LLM isn't drowned in non-code files."""
+
+    def test_drops_migrations_specs_styles_lockfiles(self):
+        files = [
+            _empty_filediff("app/controllers/embed_controller.rb"),
+            _empty_filediff("app/assets/javascripts/embed.js"),
+            _empty_filediff("db/migrate/20131217174004_create_topic_embeds.rb"),
+            _empty_filediff("spec/controllers/embed_controller_spec.rb"),
+            _empty_filediff("app/assets/stylesheets/embed.css.scss"),
+            _empty_filediff("Gemfile.lock"),
+            _empty_filediff("CHANGELOG.md"),
+        ]
+        keep = [k.path for k in _security_relevant_files(files)]
+        assert "app/controllers/embed_controller.rb" in keep
+        assert "app/assets/javascripts/embed.js" in keep
+        assert all("/migrate/" not in p for p in keep)
+        assert all("spec/" not in p for p in keep)
+        assert all(not p.endswith(".scss") for p in keep)
+        assert all(not p.endswith(".lock") for p in keep)
+        assert all(not p.endswith(".md") for p in keep)
+
+    def test_drops_test_files_by_suffix(self):
+        files = [
+            _empty_filediff("src/auth.go"),
+            _empty_filediff("src/auth_test.go"),
+            _empty_filediff("src/auth.test.ts"),
+            _empty_filediff("src/login.spec.tsx"),
+        ]
+        keep = [k.path for k in _security_relevant_files(files)]
+        assert keep == ["src/auth.go"]
+
+    def test_keeps_app_code_unchanged(self):
+        files = [
+            _empty_filediff("src/middleware.py"),
+            _empty_filediff("api/views.py"),
+            _empty_filediff("frontend/login.tsx"),
+        ]
+        keep = [k.path for k in _security_relevant_files(files)]
+        assert keep == ["src/middleware.py", "api/views.py", "frontend/login.tsx"]
+
 
 _WALKTHROUGH_LLM_RESPONSE = json.dumps(
     {
@@ -1099,6 +1156,183 @@ class TestRoundDetectionWiring:
         assert captured["review_round"] == 1
 
 
+class TestIncrementalDiff:
+    """Round 2+ should review only commits pushed since the last review."""
+
+    def _make_thread(self, **kw):
+        from mira.models import BotThreadRecord
+
+        defaults = {"thread_id": "t", "path": "a.py", "line": 1, "body": "x", "is_resolved": False}
+        defaults.update(kw)
+        return BotThreadRecord(**defaults)
+
+    def _provider_with_threads_and_compare(self, threads, full_diff="FULL", incremental="INCR"):
+        from mira.models import PRInfo
+
+        mock_provider = MagicMock()
+        mock_provider.get_pr_info = AsyncMock(
+            return_value=PRInfo(
+                title="t",
+                description="",
+                base_branch="main",
+                head_branch="f",
+                url="https://github.com/o/r/pull/1",
+                number=1,
+                owner="o",
+                repo="r",
+                head_sha="HEAD_SHA",
+            )
+        )
+        mock_provider.get_pr_diff = AsyncMock(return_value=full_diff)
+        mock_provider.get_compare_diff = AsyncMock(return_value=incremental)
+        mock_provider.get_unresolved_bot_threads = AsyncMock(return_value=[])
+        mock_provider.get_all_bot_threads = AsyncMock(return_value=threads)
+        mock_provider.find_bot_comment = AsyncMock(return_value=None)
+        mock_provider.post_comment = AsyncMock()
+        mock_provider.update_comment = AsyncMock()
+        mock_provider.resolve_outdated_review_threads = AsyncMock(return_value=0)
+        return mock_provider
+
+    @pytest.mark.asyncio
+    async def test_round_2_uses_incremental_when_sha_stored(self, monkeypatch):
+        """If a last_reviewed_sha exists for this PR, fetch and use the
+        incremental diff (last_sha..head_sha) instead of the full PR diff."""
+        from mira.core.engine import ReviewEngine
+
+        mock_provider = self._provider_with_threads_and_compare(
+            threads=[self._make_thread()],
+        )
+
+        mock_db = MagicMock()
+        mock_db.get_last_reviewed_sha = MagicMock(return_value="OLD_SHA")
+        mock_db.get_repo = MagicMock(return_value=None)
+        mock_db.set_last_reviewed_sha = MagicMock()
+        monkeypatch.setattr("mira.dashboard.api._app_db", mock_db)
+
+        captured: dict = {}
+
+        async def fake_internal(self, diff_text, **kwargs):
+            captured["diff_text"] = diff_text
+            from mira.models import ReviewResult
+
+            return ReviewResult(comments=[], summary="")
+
+        monkeypatch.setattr(ReviewEngine, "_review_diff_internal", fake_internal)
+
+        engine = ReviewEngine(
+            config=MiraConfig(),
+            llm=AsyncMock(),
+            provider=mock_provider,
+            bot_name="mira",
+        )
+        await engine.review_pr("https://github.com/o/r/pull/1")
+
+        # Compare API was called with the right SHAs and result was used.
+        mock_provider.get_compare_diff.assert_awaited_once()
+        args = mock_provider.get_compare_diff.call_args
+        assert args.args[1] == "OLD_SHA"
+        assert args.args[2] == "HEAD_SHA"
+        assert captured["diff_text"] == "INCR"
+
+    @pytest.mark.asyncio
+    async def test_round_2_falls_back_to_full_diff_when_no_sha(self, monkeypatch):
+        """Missing last_reviewed_sha → no incremental fetch, full diff used.
+        Backward compat for PRs that existed before the feature shipped."""
+        from mira.core.engine import ReviewEngine
+
+        mock_provider = self._provider_with_threads_and_compare(
+            threads=[self._make_thread()],
+        )
+
+        mock_db = MagicMock()
+        mock_db.get_last_reviewed_sha = MagicMock(return_value="")
+        mock_db.get_repo = MagicMock(return_value=None)
+        mock_db.set_last_reviewed_sha = MagicMock()
+        monkeypatch.setattr("mira.dashboard.api._app_db", mock_db)
+
+        captured: dict = {}
+
+        async def fake_internal(self, diff_text, **kwargs):
+            captured["diff_text"] = diff_text
+            from mira.models import ReviewResult
+
+            return ReviewResult(comments=[], summary="")
+
+        monkeypatch.setattr(ReviewEngine, "_review_diff_internal", fake_internal)
+
+        engine = ReviewEngine(
+            config=MiraConfig(),
+            llm=AsyncMock(),
+            provider=mock_provider,
+            bot_name="mira",
+        )
+        await engine.review_pr("https://github.com/o/r/pull/1")
+
+        mock_provider.get_compare_diff.assert_not_called()
+        assert captured["diff_text"] == "FULL"
+
+    @pytest.mark.asyncio
+    async def test_round_1_does_not_use_compare(self, monkeypatch):
+        """Round 1 must always do a full review — no incremental."""
+        from mira.core.engine import ReviewEngine
+
+        mock_provider = self._provider_with_threads_and_compare(threads=[])
+
+        mock_db = MagicMock()
+        mock_db.get_last_reviewed_sha = MagicMock(return_value="OLD_SHA")
+        mock_db.get_repo = MagicMock(return_value=None)
+        mock_db.set_last_reviewed_sha = MagicMock()
+        monkeypatch.setattr("mira.dashboard.api._app_db", mock_db)
+
+        async def fake_internal(self, diff_text, **kwargs):
+            from mira.models import ReviewResult
+
+            return ReviewResult(comments=[], summary="")
+
+        monkeypatch.setattr(ReviewEngine, "_review_diff_internal", fake_internal)
+
+        engine = ReviewEngine(
+            config=MiraConfig(),
+            llm=AsyncMock(),
+            provider=mock_provider,
+            bot_name="mira",
+        )
+        await engine.review_pr("https://github.com/o/r/pull/1")
+
+        mock_provider.get_compare_diff.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_records_head_sha_after_review(self, monkeypatch):
+        """After a successful review, the current head SHA is anchored so
+        round 2 has a base for the incremental diff."""
+        from mira.core.engine import ReviewEngine
+
+        mock_provider = self._provider_with_threads_and_compare(threads=[])
+
+        mock_db = MagicMock()
+        mock_db.get_last_reviewed_sha = MagicMock(return_value="")
+        mock_db.get_repo = MagicMock(return_value=None)
+        mock_db.set_last_reviewed_sha = MagicMock()
+        monkeypatch.setattr("mira.dashboard.api._app_db", mock_db)
+
+        async def fake_internal(self, diff_text, **kwargs):
+            from mira.models import ReviewResult
+
+            return ReviewResult(comments=[], summary="")
+
+        monkeypatch.setattr(ReviewEngine, "_review_diff_internal", fake_internal)
+
+        engine = ReviewEngine(
+            config=MiraConfig(),
+            llm=AsyncMock(),
+            provider=mock_provider,
+            bot_name="mira",
+        )
+        await engine.review_pr("https://github.com/o/r/pull/1")
+
+        mock_db.set_last_reviewed_sha.assert_called_once_with("o", "r", 1, "HEAD_SHA")
+
+
 class TestSelfCritique:
     """Second-pass critique drops confidently-wrong findings before posting."""
 
@@ -1191,6 +1425,79 @@ class TestSelfCritique:
         engine = ReviewEngine(config=MiraConfig(), llm=AsyncMock(), provider=None)
         kept = await engine._self_critique([])
         assert kept == []
+
+
+class TestSecurityReviewPass:
+    """Dedicated security pass returns comments tagged category=security."""
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_when_no_files(self):
+        from mira.core.engine import ReviewEngine
+
+        engine = ReviewEngine(config=MiraConfig(), llm=AsyncMock(), provider=None)
+        out = await engine._security_review_pass([], "title")
+        assert out == []
+
+    @pytest.mark.asyncio
+    async def test_runs_llm_and_parses_comments(self, sample_diff_text):
+        """Happy path: LLM returns a security finding, we get a ReviewComment."""
+        from mira.core.diff_parser import parse_diff
+        from mira.core.engine import ReviewEngine
+
+        files = parse_diff(sample_diff_text).files
+        # Pick a verbatim line from the diff so the existing_code citation
+        # validates — the parser drops comments whose citation isn't in the
+        # diff (anti-hallucination check).
+        cited_line = None
+        for h in files[0].hunks:
+            for raw in h.content.splitlines():
+                if raw.startswith("+") and not raw.startswith("+++"):
+                    cited_line = raw[1:]
+                    break
+            if cited_line:
+                break
+        assert cited_line, "fixture must contain at least one added line"
+        canned = json.dumps(
+            {
+                "comments": [
+                    {
+                        "path": files[0].path,
+                        "line": 1,
+                        "severity": "blocker",
+                        "category": "bug",  # LLM forgot — engine should fix to security
+                        "title": "SQL injection",
+                        "body": "Concatenating user input into a query.",
+                        "confidence": 0.9,
+                        "existing_code": cited_line,
+                    }
+                ],
+                "summary": "",
+                "metadata": {"reviewed_files": 1},
+            }
+        )
+        llm = MagicMock(spec=LLMProvider)
+        llm.complete_with_tools = AsyncMock(return_value=canned)
+
+        engine = ReviewEngine(config=MiraConfig(), llm=llm, provider=None)
+        out = await engine._security_review_pass(files, "title")
+        assert len(out) == 1
+        # Engine forces category=security regardless of what the LLM returned.
+        assert out[0].category == "security"
+        assert out[0].title == "SQL injection"
+
+    @pytest.mark.asyncio
+    async def test_returns_empty_on_llm_failure(self, sample_diff_text):
+        """LLM error must not crash — return empty so main review proceeds."""
+        from mira.core.diff_parser import parse_diff
+        from mira.core.engine import ReviewEngine
+
+        files = parse_diff(sample_diff_text).files
+        llm = MagicMock(spec=LLMProvider)
+        llm.complete_with_tools = AsyncMock(side_effect=RuntimeError("LLM down"))
+
+        engine = ReviewEngine(config=MiraConfig(), llm=llm, provider=None)
+        out = await engine._security_review_pass(files, "title")
+        assert out == []
 
 
 class TestRegenerateSummary:

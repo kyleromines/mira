@@ -51,6 +51,25 @@ class TestParseLLMResponse:
         assert result.comments == []
         assert result.summary == ""
 
+    def test_parses_double_encoded_comments_array(self):
+        """Haiku occasionally returns ``comments`` as a stringified JSON
+        array — sometimes pretty-printed with raw newlines that strict
+        JSON rejects. The parser must recover both the outer and inner."""
+        inner = (
+            "[\n  {\n"
+            '    "path": "a.py",\n'
+            '    "line": 10,\n'
+            '    "body": "raw newlines inside the string",\n'
+            '    "existing_code": "x"\n'
+            "  }\n]"
+        )
+        # Outer JSON has the inner as a quoted string with raw newlines —
+        # invalid in strict mode, valid with strict=False.
+        raw = '{"comments": "' + inner.replace('"', '\\"') + '", "summary": ""}'
+        result = parse_llm_response(raw)
+        assert len(result.comments) == 1
+        assert result.comments[0].body == "raw newlines inside the string"
+
 
 class TestConvertToReviewComments:
     def test_converts_comments(self, sample_llm_response_text: str):
@@ -168,7 +187,8 @@ class TestExistingCodeValidation:
         assert len(comments) == 1
 
     def test_keeps_comment_without_existing_code(self):
-        """Comments without existing_code should pass through unchanged."""
+        """An empty/missing citation is permitted — only present-but-wrong
+        citations are dropped as hallucinations."""
         data = json.dumps(
             {
                 "comments": [
@@ -347,3 +367,47 @@ class TestSuggestionWithoutBody:
         response = parse_llm_response(data)
         comments = convert_to_review_comments(response, valid_paths={"a.py"})
         assert len(comments) == 1
+
+
+class TestSanitizeMermaid:
+    """The walkthrough's sequence_diagram is post-processed to repair
+    nested-quote labels — `engine["core/"engine.py""]` would otherwise
+    break Mermaid's parser on GitHub. See PR#41 for the failure mode."""
+
+    def _sanitize(self, diagram: str) -> str:
+        from mira.llm.response_parser import _sanitize_mermaid
+
+        return _sanitize_mermaid(diagram)
+
+    def test_repairs_nested_quotes_single_node(self):
+        diagram = 'graph LR\n    engine["core/"engine.py""]\n'
+        out = self._sanitize(diagram)
+        assert '"core/engine.py"' in out
+        assert 'core/"engine.py"' not in out
+
+    def test_repairs_nested_quotes_multiple_nodes(self):
+        diagram = 'graph LR\n    a["x/"a.py""]\n    b["y/"b.py""]\n    a --> b\n'
+        out = self._sanitize(diagram)
+        assert '["x/a.py"]' in out
+        assert '["y/b.py"]' in out
+
+    def test_passthrough_well_formed(self):
+        diagram = 'graph LR\n    engine["core/engine.py"]\n    engine --> jit'
+        assert self._sanitize(diagram) == diagram
+
+    def test_passthrough_unquoted_labels(self):
+        diagram = "graph LR\n    a --> b\n    b --> c"
+        assert self._sanitize(diagram) == diagram
+
+    def test_handles_empty_or_none(self):
+        from mira.llm.response_parser import _sanitize_mermaid
+
+        assert _sanitize_mermaid("") == ""
+
+    def test_repairs_label_with_extra_garbage(self):
+        """Real failure mode from PR#41 — a path like `prompts/"review.py" + footguns.py"`
+        gets cleaned to `prompts/review.py + footguns.py`."""
+        diagram = 'graph LR\n    prompts["llm/prompts/"review.py" + "footguns.py""]\n'
+        out = self._sanitize(diagram)
+        # All inner quotes stripped, single pair around the cleaned label.
+        assert '["llm/prompts/review.py + footguns.py"]' in out
