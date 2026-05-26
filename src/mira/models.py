@@ -134,9 +134,7 @@ class ReviewComment:
     confidence: float
     suggestion: str | None = None
     agent_prompt: str | None = None
-    # Verbatim code from the diff that the comment targets — used by the
-    # self-critique pass to ground the LLM's analysis against actual code,
-    # and stripped before posting (not surfaced in the rendered comment).
+    # Verbatim diff snippet used by self-critique; stripped before posting.
     existing_code: str = ""
 
 
@@ -216,10 +214,8 @@ class WalkthroughResult:
 
         if self.sequence_diagram:
             diagram = self.sequence_diagram.strip()
-            # Only render if it looks like valid Mermaid. Quote-wrapping for
-            # node labels with dots/slashes is handled upstream in
-            # `_sanitize_mermaid` — re-running it here would re-introduce
-            # the nested-quote bug it just fixed.
+            # _sanitize_mermaid has already quoted labels with dots/slashes;
+            # re-quoting here would reintroduce the nested-quote bug.
             if diagram and any(
                 diagram.startswith(k) for k in ("graph ", "flowchart ", "sequenceDiagram")
             ):
@@ -355,9 +351,7 @@ class ReviewResult:
     token_usage: dict[str, int] = field(default_factory=dict)
     walkthrough: WalkthroughResult | None = None
     thread_decisions: list[ThreadDecision] = field(default_factory=list)
-    # Paths selected for this review pass + paths intentionally skipped due to
-    # size or priority caps. Surfaced in the walkthrough banner so users can
-    # invoke `@mira-bot review-rest` to review the remainder.
+    # Surfaced in the walkthrough banner so @mira-bot review-rest can target the rest.
     reviewed_paths: list[str] = field(default_factory=list)
     skipped_paths: list[str] = field(default_factory=list)
     total_paths: list[str] = field(default_factory=list)
@@ -375,10 +369,7 @@ class PRInfo:
     number: int
     owner: str
     repo: str
-    # Current head commit SHA. Used by round 2+ reviews to fetch the
-    # incremental diff (last reviewed SHA → current head SHA) instead of
-    # re-reviewing the full base→head diff. Empty when unknown
-    # (the engine then falls back to a full review).
+    # Round 2+ reviews diff against last_reviewed_sha → head_sha; empty falls back to full diff.
     head_sha: str = ""
 
 
