@@ -408,9 +408,9 @@ class RelationshipStore:
                 kw_b = repo_keywords.get(repo_b, set())
                 if kw_a and kw_b:
                     overlap = kw_a & kw_b
-                    union = kw_a | kw_b
-                    if union:
-                        jaccard = len(overlap) / len(union)
+                    merged = kw_a | kw_b
+                    if merged:
+                        jaccard = len(overlap) / len(merged)
                         if jaccard >= 0.20 and len(overlap) >= 3:
                             pair = frozenset([repo_a, repo_b])
                             top_shared = sorted(overlap)[:5]
@@ -460,7 +460,7 @@ class RelationshipStore:
                 union(repos[0], repos[1])
 
         clusters: dict[str, list[str]] = {}
-        all_in_pairs = set()
+        all_in_pairs: set[str] = set()
         for pair in qualified_pairs:
             all_in_pairs.update(pair)
         for repo in all_in_pairs:
@@ -485,10 +485,10 @@ class RelationshipStore:
 
             seen: set[str] = set()
             unique_evidence: list[str] = []
-            for e in all_evidence:
-                if e not in seen:
-                    seen.add(e)
-                    unique_evidence.append(e)
+            for evidence in all_evidence:
+                if evidence not in seen:
+                    seen.add(evidence)
+                    unique_evidence.append(evidence)
 
             group_name = self._derive_group_name(members, repo_keywords)
 

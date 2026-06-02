@@ -190,12 +190,12 @@ class AgenticToolExecutor:
                 rx = re.compile(pattern)
             except re.error:
                 # Treat as substring on regex error.
-                hits = [p for p in candidates if pattern in p][:_MAX_GREP_HITS]
+                path_hits = [p for p in candidates if pattern in p][:_MAX_GREP_HITS]
             else:
-                hits = [p for p in candidates if rx.search(p)][:_MAX_GREP_HITS]
-            if not hits:
+                path_hits = [p for p in candidates if rx.search(p)][:_MAX_GREP_HITS]
+            if not path_hits:
                 return f"[no path matches for `{pattern}`]"
-            return "Path matches:\n" + "\n".join(f"- `{p}`" for p in hits)
+            return "Path matches:\n" + "\n".join(f"- `{p}`" for p in path_hits)
 
         try:
             rx = re.compile(pattern)

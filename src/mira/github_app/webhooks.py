@@ -131,7 +131,7 @@ def create_app(
             )
 
         if event == "pull_request" and action in _PR_ACTIONS:
-            sender: str = payload.get("sender", {}).get("login", "")
+            sender = payload.get("sender", {}).get("login", "")
             if sender == f"{bot_name}[bot]":
                 logger.debug("Ignoring pull_request event from self (%s)", sender)
                 return Response(

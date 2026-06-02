@@ -13,7 +13,14 @@ from mira.core.context import expand_context
 from mira.core.diff_parser import parse_diff
 from mira.core.file_filter import filter_files
 from mira.core.noise_filter import filter_noise
+from mira.core.passes import (
+    agentic_review_loop,
+    regenerate_summary,
+    security_review_pass,
+    self_critique,
+)
 from mira.core.priority import rank_files
+from mira.core.threads import resolve_verified_threads, short_thread_description
 from mira.exceptions import ResponseParseError
 from mira.index.context import build_code_context
 from mira.index.store import IndexStore
@@ -21,7 +28,6 @@ from mira.llm.prompts.review import (
     build_review_prompt,
     build_walkthrough_prompt,
 )
-from mira.llm.prompts.verify_fixes import build_verify_fixes_prompt, parse_verify_fixes_response
 from mira.llm.provider import LLMProvider
 from mira.llm.response_parser import (
     convert_to_review_comments,
@@ -91,11 +97,7 @@ def _clamp_confidence_to_findings(
         )
 
 
-_MAX_FULL_FILE_LINES = 500
-_LARGE_FILE_CONTEXT_LINES = 50  # ±50 lines = 100-line window
-
-
-# Paths excluded from the dedicated security pass — see _security_review_pass.
+# Paths excluded from the dedicated security pass — see core/passes.py.
 # Keep conservative: anything that might house auth/crypto/origin/injection logic stays in.
 _SECURITY_PASS_SKIP_PATTERNS = (
     # DB migrations: schema changes, indexes — no request handling.
@@ -216,13 +218,6 @@ def _select_files_by_priority(
     return selected, skipped
 
 
-def _number_lines(content: str) -> str:
-    """Add line numbers to file content for LLM context."""
-    lines = content.splitlines()
-    width = len(str(len(lines)))
-    return "\n".join(f"{i + 1:>{width}}| {line}" for i, line in enumerate(lines))
-
-
 _ORPHAN_LINE_TOLERANCE = 3
 
 
@@ -252,55 +247,6 @@ def _drop_orphan_key_issues(
         return any(start <= ki.line <= end for start, end in by_path.get(ki.path, ()))
 
     return [ki for ki in key_issues if _matches(ki)]
-
-
-def _short_thread_description(body: str) -> str:
-    """Pull a one-line description out of a bot review-comment body for
-    use as 'already addressed' context. Strips badge/category lines and
-    looks for the first bold title; falls back to the first non-empty line.
-    """
-    body = body or ""
-    for line in body.splitlines():
-        s = line.strip()
-        if not s or s.startswith(("⚠️", "🐛", "💡", "🔒", "⚡", "🛑", "🔵", "🟡", "🟠", "🔴")):
-            continue
-        if s.startswith("**") and s.endswith("**") and len(s) > 4:
-            return s.strip("* ")[:160]
-        return s[:160]
-    return ""
-
-
-def _extract_sections(
-    lines: list[str],
-    threads: list[UnresolvedThread],
-    context_lines: int,
-) -> str:
-    """Extract and merge relevant sections around each thread's comment line.
-
-    Returns a line-numbered string with merged windows joined by ``...`` separators.
-    """
-    total = len(lines)
-    width = len(str(total))
-    ranges: list[tuple[int, int]] = []
-    for t in threads:
-        start = max(0, t.line - 1 - context_lines)
-        end = min(total, t.line - 1 + context_lines + 1)
-        ranges.append((start, end))
-
-    ranges.sort()
-    merged: list[tuple[int, int]] = [ranges[0]]
-    for start, end in ranges[1:]:
-        prev_start, prev_end = merged[-1]
-        if start <= prev_end:
-            merged[-1] = (prev_start, max(prev_end, end))
-        else:
-            merged.append((start, end))
-
-    parts: list[str] = []
-    for start, end in merged:
-        numbered = [f"{i + 1:>{width}}| {lines[i]}" for i in range(start, end)]
-        parts.append("\n".join(numbered))
-    return "\n...\n".join(parts)
 
 
 class ReviewEngine:
@@ -365,7 +311,10 @@ class ReviewEngine:
             if not self.bot_name:
                 return 0, 0, [], []
             try:
-                return await self._resolve_verified_threads(pr_info)
+                assert self.provider is not None
+                return await resolve_verified_threads(
+                    self.provider, self.llm, pr_info, self.bot_name, self.dry_run
+                )
             except Exception as exc:
                 logger.warning("Thread resolution failed, continuing: %s", exc)
                 return 0, 0, [], []
@@ -416,7 +365,7 @@ class ReviewEngine:
                     {
                         "path": t.path,
                         "line": t.line,
-                        "description": _short_thread_description(t.body),
+                        "description": short_thread_description(t.body),
                     }
                     for t in all_bot_threads
                     if t.is_resolved
@@ -502,25 +451,26 @@ class ReviewEngine:
                     stats = build_review_stats(result.comments)
 
                     cross_repo_blast: list[dict] | None = None
-                    try:
-                        from mira.index.relationships import RelationshipStore
+                    if self.config.review.blast_radius:
+                        try:
+                            from mira.index.relationships import RelationshipStore
 
-                        rs = RelationshipStore()
-                        full_name = f"{pr_info.owner}/{pr_info.repo}"
-                        edges = rs.resolve_edges()
-                        dependents = [
-                            {
-                                "repo": e.source_repo,
-                                "files": [{"kind": r.kind, "target": r.target} for r in e.refs],
-                            }
-                            for e in edges
-                            if e.target_repo == full_name
-                        ]
-                        if dependents:
-                            cross_repo_blast = dependents
-                        rs.close()
-                    except Exception:
-                        pass
+                            rs = RelationshipStore()
+                            full_name = f"{pr_info.owner}/{pr_info.repo}"
+                            edges = rs.resolve_edges()
+                            dependents = [
+                                {
+                                    "repo": e.source_repo,
+                                    "files": [{"kind": r.kind, "target": r.target} for r in e.refs],
+                                }
+                                for e in edges
+                                if e.target_repo == full_name
+                            ]
+                            if dependents:
+                                cross_repo_blast = dependents
+                            rs.close()
+                        except Exception:
+                            pass
 
                     import os as _os
 
@@ -949,7 +899,7 @@ class ReviewEngine:
                             source_fetcher=self._agentic_source_fetcher,  # type: ignore[arg-type]
                             repo_tree=list(self._agentic_repo_tree),
                         )
-                        raw_response = await self._agentic_review_loop(messages, executor)
+                        raw_response = await agentic_review_loop(self.llm, messages, executor)
                     if not raw_response:
                         raw_response = await self.llm.review(messages)
                     parsed = parse_llm_response(raw_response)
@@ -974,7 +924,12 @@ class ReviewEngine:
 
         review_task = _asyncio.gather(*[_review_chunk(i, c) for i, c in enumerate(chunks)])
         security_task = _asyncio.create_task(
-            self._security_review_pass(filtered, pr_title)
+            security_review_pass(
+                self.llm,
+                filtered,
+                _security_relevant_files(filtered),
+                pr_title,
+            )
             if self.config.review.security_pass
             else _asyncio.sleep(0, result=[])
         )
@@ -999,10 +954,17 @@ class ReviewEngine:
         )
 
         # Self-critique catches confident-but-wrong claims that the noise
-        # filter can't, since confidence scores are LLM-generated too.
+        # filter can't, since confidence scores are LLM-generated too. Pass
+        # the team's documented preferences so the critic doesn't strip
+        # findings that enforce them as "style nits".
         if final_comments and self.config.review.self_critique:
             try:
-                final_comments = await self._self_critique(final_comments)
+                final_comments = await self_critique(
+                    self.llm,
+                    final_comments,
+                    learned_rules=learned_rules or None,
+                    custom_rules=custom_rules or None,
+                )
             except Exception as exc:
                 logger.warning("Self-critique pass failed, keeping original comments: %s", exc)
 
@@ -1013,7 +975,8 @@ class ReviewEngine:
             # Regenerate from the FINAL filed outputs so summary prose can't
             # claim issues that were dropped by the filter/critique passes.
             try:
-                summary = await self._regenerate_summary(
+                summary = await regenerate_summary(
+                    self.llm,
                     final_comments,
                     all_key_issues,
                     pr_title,
@@ -1039,421 +1002,3 @@ class ReviewEngine:
             skipped_paths=skipped_paths_only,
             total_paths=all_paths,
         )
-
-    async def _agentic_review_loop(
-        self,
-        messages: list[dict],
-        executor: object,
-    ) -> str:
-        """Run an agentic tool-use loop until the LLM submits a review.
-
-        Hands the model `read_file` and `grep_repo` alongside the terminal
-        `submit_review` tool. Each hop: call the model, dispatch any
-        non-terminal tool calls, append results, repeat. Caps at 6 hops so
-        a confused model can't burn unbounded tokens.
-
-        Returns the JSON args of the final `submit_review` call (same
-        shape `self.llm.review` returns), or "" if the loop exited without
-        one — caller falls back to a forced single-tool call.
-        """
-        import json as _json
-
-        from mira.llm.agentic_tools import AGENTIC_TOOLS
-        from mira.llm.provider import SUBMIT_REVIEW_TOOL
-
-        tools = [*AGENTIC_TOOLS, SUBMIT_REVIEW_TOOL]
-        convo: list[dict] = [dict(m) for m in messages]
-        if convo and convo[0].get("role") == "system":
-            convo[0]["content"] = (
-                convo[0]["content"] + "\n\n## Tools\n\n"
-                "This repo isn't indexed, so you have two helpers for "
-                "cross-file checks: `read_file(path)` and "
-                "`grep_repo(pattern, path_glob?, path_only?)`. Use them when, "
-                "and ONLY when, you need to verify a cross-file claim before "
-                "filing a comment (e.g. *does the called function actually "
-                "raise X?*, *is this symbol defined elsewhere?*). Don't browse — "
-                "fetch what you specifically need. Skip the tools entirely if "
-                "the diff alone is enough. Once you're ready, call "
-                "`submit_review` with all your findings."
-            )
-
-        max_hops = 6
-        for hop in range(max_hops):
-            try:
-                msg = await self.llm.complete_agentic(convo, tools=tools)
-            except Exception as exc:
-                logger.warning("Agentic hop %d failed: %s", hop + 1, exc)
-                return ""
-
-            tool_calls = msg.get("tool_calls") or []
-            content = msg.get("content") or ""
-
-            if not tool_calls:
-                logger.debug(
-                    "Agentic loop exited at hop %d without submit_review (content=%d chars)",
-                    hop + 1,
-                    len(content),
-                )
-                return ""
-
-            convo.append(
-                {
-                    "role": "assistant",
-                    "content": content,
-                    "tool_calls": tool_calls,
-                }
-            )
-
-            for call in tool_calls:
-                fn = call.get("function") or {}
-                name = fn.get("name") or ""
-                if name == "submit_review":
-                    return fn.get("arguments") or ""
-
-                raw_args = fn.get("arguments") or "{}"
-                try:
-                    args = _json.loads(raw_args) if isinstance(raw_args, str) else raw_args
-                except Exception:
-                    args = {}
-
-                tool_result = await executor.execute(name, args)  # type: ignore[attr-defined]
-                convo.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.get("id") or "",
-                        "content": tool_result,
-                    }
-                )
-
-        logger.debug("Agentic loop hit %d-hop cap without submit_review", max_hops)
-        return ""
-
-    async def _security_review_pass(
-        self,
-        files: list,
-        pr_title: str = "",
-    ) -> list[ReviewComment]:
-        """Dedicated security review on the configured indexing model.
-
-        Runs in parallel with the main review. The output is a list of
-        ``ReviewComment`` to merge into ``all_comments`` before noise
-        filtering — overlapping findings dedupe naturally.
-
-        Routed through the indexing tier (typically a smaller, cheaper
-        model) because security findings here are mostly pattern-shaped
-        — XSS, injection, hard-coded secrets, missing CSRF — and don't
-        need the deeper reasoning the main pass does. Defense-in-depth:
-        the main pass on the review tier still catches the chained-
-        inference security bugs. Users who want the heavy model on
-        every pass can set ``llm.indexing_model`` to the same model as
-        ``llm.review_model``.
-
-        Returns ``[]`` and logs (debug) on any failure so a transient
-        LLM/API error doesn't kill the main review.
-        """
-        if not files:
-            return []
-
-        # Strip migrations / lockfiles / specs so the model isn't distracted from
-        # the actual vulnerable code; on an all-noise PR, fall back to the full set.
-        narrowed = _security_relevant_files(files) or files
-
-        from mira.config import load_config
-        from mira.dashboard.models_config import llm_config_for
-        from mira.llm.prompts.review import build_security_review_prompt
-        from mira.llm.provider import SUBMIT_REVIEW_TOOL, LLMProvider
-
-        try:
-            base_config = load_config()
-            security_llm = LLMProvider(llm_config_for("indexing", base_config.llm))
-        except Exception:
-            security_llm = self.llm
-
-        messages = build_security_review_prompt(files=narrowed, pr_title=pr_title)
-        try:
-            raw = await security_llm.complete_with_tools(
-                messages=messages,
-                tools=[SUBMIT_REVIEW_TOOL],
-                temperature=0.0,
-            )
-        except Exception as exc:
-            # Retry on the main LLM rather than drop the security pass entirely.
-            if security_llm is not self.llm:
-                logger.debug(
-                    "Security pass on indexing tier failed (%s); retrying on review LLM",
-                    exc,
-                )
-                try:
-                    raw = await self.llm.complete_with_tools(
-                        messages=messages,
-                        tools=[SUBMIT_REVIEW_TOOL],
-                        temperature=0.0,
-                    )
-                except Exception as exc2:
-                    logger.warning("Security review pass failed: %s", exc2)
-                    return []
-            else:
-                logger.warning("Security review pass failed: %s", exc)
-                return []
-
-        try:
-            parsed = parse_llm_response(raw)
-            comments = convert_to_review_comments(parsed, diff_files=files)
-        except ResponseParseError as exc:
-            logger.warning("Security review pass parse error: %s", exc)
-            return []
-        except Exception as exc:
-            logger.warning("Security review pass conversion failed: %s", exc)
-            return []
-
-        for c in comments:
-            if not c.category or c.category != "security":
-                c.category = "security"
-        if comments:
-            logger.info("Security pass produced %d candidate comment(s)", len(comments))
-        return comments
-
-    async def _self_critique(self, comments: list[ReviewComment]) -> list[ReviewComment]:
-        """Run a second-pass critique on each draft comment.
-
-        The critic asks: *for each comment, can you cite specific lines that
-        prove this is a real, actionable issue?* Comments without verifiable
-        citations or with confidently-wrong analysis get dropped.
-
-        Uses the configured indexing model — the critic is a verification
-        step, not a generation step. Returns the kept comments in their
-        original order.
-        """
-        import json as _json
-
-        from mira.config import load_config
-        from mira.dashboard.models_config import llm_config_for
-        from mira.llm.provider import SUBMIT_CRITIQUE_TOOL, LLMProvider
-
-        if not comments:
-            return comments
-
-        draft_lines = []
-        for i, c in enumerate(comments):
-            cited = (c.existing_code or "").strip()
-            if len(cited) > 400:
-                cited = cited[:400] + "…"
-            draft_lines.append(
-                f"[{i}] {c.path}:{c.line} — {c.severity.name} / {c.category}\n"
-                f"    Title: {c.title}\n"
-                f"    Body:  {(c.body or '').strip()[:500]}\n"
-                f"    Cites: {cited or '(no code citation)'}\n"
-            )
-
-        critic_prompt = (
-            "You are reviewing draft PR comments produced by another reviewer. "
-            "Your job is to filter out confidently-wrong analyses, speculation, "
-            "and 'while I'm here' nitpicks. Keep only comments where the cited "
-            "code clearly proves the issue and the fix is actionable.\n\n"
-            "Be especially skeptical of:\n"
-            "- Claims about Python/JS semantics that don't match the actual "
-            "  language behaviour (e.g. 'decorator only registers last route' "
-            "  is wrong; stacked decorators register both)\n"
-            "- Race-condition or timing arguments that depend on lines not in "
-            "  the citation\n"
-            "- 'May not be valid' / 'could potentially' hedges without proof\n"
-            "- Style preferences masquerading as warnings\n\n"
-            "If the cited code clearly proves the issue, KEEP it. If you're "
-            "unsure or it looks speculative, DROP it.\n\n"
-            "## Draft comments\n\n" + "\n".join(draft_lines)
-        )
-
-        try:
-            base_config = load_config()
-            critic_llm = LLMProvider(llm_config_for("indexing", base_config.llm))
-        except Exception:
-            critic_llm = self.llm
-
-        try:
-            raw = await critic_llm.complete_with_tools(
-                messages=[{"role": "user", "content": critic_prompt}],
-                tools=[SUBMIT_CRITIQUE_TOOL],
-                temperature=0.0,
-            )
-            data = _json.loads(raw) if raw else {}
-        except Exception as exc:
-            logger.warning("Self-critique LLM call failed: %s. Keeping all drafts.", exc)
-            return comments
-
-        verdicts = data.get("verdicts") or []
-        if not isinstance(verdicts, list):
-            return comments
-
-        keep_indices = {int(v["index"]) for v in verdicts if v.get("keep") is True}
-        for v in verdicts:
-            if v.get("keep") is False and 0 <= int(v.get("index", -1)) < len(comments):
-                idx = int(v["index"])
-                logger.info(
-                    "Self-critique dropped [%d] %s:%d — %s",
-                    idx,
-                    comments[idx].path,
-                    comments[idx].line,
-                    str(v.get("reason", "no reason"))[:120],
-                )
-
-        return [c for i, c in enumerate(comments) if i in keep_indices]
-
-    async def _regenerate_summary(
-        self,
-        comments: list[ReviewComment],
-        key_issues: list[KeyIssue],
-        pr_title: str,
-        pr_description: str,
-        fallback: str,
-    ) -> str:
-        """Rewrite the review summary so it describes only what was actually filed.
-
-        The first-pass summary is generated alongside the comments and can
-        mention issues that never got filed (LLM put them in prose only) or
-        that were later dropped by noise filter / self-critique / orphan
-        filter. Regenerate from the surviving structured outputs using the
-        configured indexing model so the prose stays grounded in the Key
-        Issues table and inline comments that actually shipped.
-        """
-        if not comments and not key_issues:
-            return "No issues found."
-
-        from mira.config import load_config
-        from mira.dashboard.models_config import llm_config_for
-        from mira.llm.provider import LLMProvider
-
-        filed_lines = []
-        for c in comments:
-            filed_lines.append(f"- {c.path}:{c.line} [{c.severity.name} / {c.category}] {c.title}")
-        for ki in key_issues:
-            filed_lines.append(f"- KEY: {ki.path}:{ki.line} — {ki.issue[:200]}")
-
-        title_line = f"PR title: {pr_title}\n" if pr_title else ""
-        desc_line = f"PR description: {pr_description[:400]}\n" if pr_description else ""
-        prompt = (
-            "Write a 2-3 sentence summary of a PR review. The summary will "
-            "appear at the top of the review on GitHub. It must describe "
-            "ONLY the issues listed below — do NOT invent, speculate, or "
-            "mention concerns that aren't in this list. If the list is "
-            "empty, say the PR looks clean. Use plain prose, no markdown "
-            "headers or bullets. Reference file paths inline where it "
-            "helps.\n\n"
-            f"{title_line}{desc_line}\n"
-            "## Filed issues\n\n"
-            + "\n".join(filed_lines)
-            + "\n\nReturn just the summary text — no preamble, no quotes."
-        )
-
-        try:
-            base_config = load_config()
-            summary_llm = LLMProvider(llm_config_for("indexing", base_config.llm))
-        except Exception:
-            summary_llm = self.llm
-
-        try:
-            text = await summary_llm.complete(
-                messages=[{"role": "user", "content": prompt}],
-                json_mode=False,
-                temperature=0.0,
-            )
-        except Exception as exc:
-            logger.warning("Summary regen LLM call failed: %s", exc)
-            return fallback or "No issues found."
-
-        text = (text or "").strip()
-        return text or fallback or "No issues found."
-
-    async def _resolve_verified_threads(
-        self, pr_info: PRInfo
-    ) -> tuple[int, int, list[UnresolvedThread], list[ThreadDecision]]:
-        """Check all unresolved bot threads and resolve those the LLM confirms as fixed.
-
-        Returns:
-            Tuple of (threads_checked, threads_resolved, remaining_unresolved, decisions).
-        """
-        assert self.provider is not None
-
-        threads = await self.provider.get_unresolved_bot_threads(pr_info, self.bot_name)
-        if not threads:
-            logger.debug("No unresolved bot threads found for PR %s", pr_info.url)
-            return 0, 0, [], []
-
-        logger.info(
-            "Found %d unresolved bot thread(s) to verify on PR %s",
-            len(threads),
-            pr_info.url,
-        )
-
-        file_contents: dict[str, str] = {}
-        for t in threads:
-            if t.path not in file_contents:
-                file_contents[t.path] = await self.provider.get_file_content(
-                    pr_info, t.path, pr_info.head_branch
-                )
-
-        threads_by_path: dict[str, list[UnresolvedThread]] = {}
-        for t in threads:
-            threads_by_path.setdefault(t.path, []).append(t)
-
-        file_groups: list[tuple[str, str, list[UnresolvedThread]]] = []
-        for path, path_threads in threads_by_path.items():
-            content = file_contents.get(path, "")
-            lines = content.splitlines()
-            if len(lines) <= _MAX_FULL_FILE_LINES:
-                file_groups.append((path, _number_lines(content), path_threads))
-            else:
-                has_unknown_lines = any(t.line <= 0 for t in path_threads)
-                if has_unknown_lines:
-                    file_groups.append((path, _number_lines(content), path_threads))
-                else:
-                    snippet = _extract_sections(lines, path_threads, _LARGE_FILE_CONTEXT_LINES)
-                    file_groups.append((path, snippet, path_threads))
-
-        verified_ids = await self._verify_fixes(file_groups)
-        verified_set = set(verified_ids)
-
-        decisions = [
-            ThreadDecision(
-                thread_id=t.thread_id,
-                path=t.path,
-                line=t.line,
-                body=t.body,
-                fixed=t.thread_id in verified_set,
-            )
-            for t in threads
-        ]
-
-        resolved = 0
-        if verified_ids:
-            if self.dry_run:
-                resolved = len(verified_ids)
-                logger.info("Dry run: would resolve %d thread(s): %s", resolved, verified_ids)
-            else:
-                resolved = await self.provider.resolve_threads(pr_info, verified_ids)
-                if resolved < len(verified_ids):
-                    logger.error(
-                        "Failed to resolve %d/%d verified-fixed thread(s) on PR %s",
-                        len(verified_ids) - resolved,
-                        len(verified_ids),
-                        pr_info.url,
-                    )
-
-        logger.info(
-            "LLM verification: checked %d thread(s), %d confirmed fixed, %d resolved",
-            len(threads),
-            len(verified_ids),
-            resolved,
-        )
-
-        remaining = [t for t in threads if t.thread_id not in verified_set]
-        return len(threads), resolved, remaining, decisions
-
-    async def _verify_fixes(
-        self, file_groups: list[tuple[str, str, list[UnresolvedThread]]]
-    ) -> list[str]:
-        """Ask the LLM which review issues have been fixed."""
-        prompt = build_verify_fixes_prompt(file_groups)
-        logger.debug("Verify-fixes prompt:\n%s", prompt[1]["content"])
-        response = await self.llm.complete(prompt, json_mode=True, temperature=0.0)
-        logger.debug("Verify-fixes raw response:\n%s", response)
-        return parse_verify_fixes_response(response)
