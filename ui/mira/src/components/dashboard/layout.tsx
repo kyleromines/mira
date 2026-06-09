@@ -167,11 +167,6 @@ export function DashboardLayout() {
                   </div>
                   <div className="flex flex-col leading-tight">
                     <span className="text-sm font-semibold">Mira</span>
-                    {version && (
-                      <span className="text-[10px] text-muted-foreground tabular-nums">
-                        v{version}
-                      </span>
-                    )}
                   </div>
                 </a>
               </SidebarMenuButton>
@@ -211,6 +206,11 @@ export function DashboardLayout() {
           <SidebarMenu>
             <UserMenu />
           </SidebarMenu>
+          {version && (
+            <span className="px-2 pb-1 text-[10px] text-muted-foreground tabular-nums group-data-[collapsible=icon]:hidden">
+              v{version}
+            </span>
+          )}
         </SidebarFooter>
 
         <SidebarRail />
