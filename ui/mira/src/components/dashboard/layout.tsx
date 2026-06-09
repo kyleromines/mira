@@ -34,7 +34,6 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible"
-import { Separator } from "@/components/ui/separator"
 import {
   Sidebar,
   SidebarContent,
@@ -147,7 +146,7 @@ export function DashboardLayout() {
   // Active styling keys off aria-current, which NavLink sets on the active
   // link — single source of truth, no parallel route-matching here.
   const navActive =
-    "aria-[current=page]:bg-sidebar-accent aria-[current=page]:font-medium aria-[current=page]:text-sidebar-accent-foreground"
+    "aria-[current=page]:bg-sidebar-accent aria-[current=page]:font-semibold aria-[current=page]:text-sidebar-accent-foreground"
 
   // Fetch the running Mira version once on mount and render it next to the
   // logo. Falls back silently if the call fails (e.g. older backend without
@@ -202,6 +201,11 @@ export function DashboardLayout() {
             <SidebarGroupContent>
               <SidebarMenu>
                 {visibleNav.map((item) => (
+                  // Active state is driven entirely by NavLink: it sets
+                  // aria-current="page" on the active link (with the same
+                  // prefix matching `end` controls), so styling off
+                  // aria-current keeps a single source of truth instead of
+                  // recomputing the match here.
                   <SidebarMenuItem key={item.to}>
                     <SidebarMenuButton asChild className={navActive}>
                       <NavLink to={item.to} end={item.to === "/"}>
@@ -265,7 +269,6 @@ export function DashboardLayout() {
       <SidebarInset>
         <header className="flex h-12 shrink-0 items-center gap-2 border-b px-4">
           <SidebarTrigger className="-ml-1" />
-          <Separator orientation="vertical" className="mr-2 h-4" />
           <AppBreadcrumb />
         </header>
         <main className="flex-1 overflow-auto">
