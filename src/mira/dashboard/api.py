@@ -523,7 +523,14 @@ def set_models(body: ModelsUpdate) -> dict:
         )
     _app_db.set_setting("indexing_model", body.indexing_model)
     _app_db.set_setting("review_model", body.review_model)
-    _app_db.set_setting("review_thinking_mode", body.review_thinking_mode)
+    # Clear "off" to "" rather than persisting the literal — "off" is the
+    # default, and a stored value would shadow a mira.yaml
+    # `review_reasoning_effort` override. "" (not None — the column is NOT NULL)
+    # reads back as unset so the config fallback chain works.
+    if body.review_thinking_mode and body.review_thinking_mode != "off":
+        _app_db.set_setting("review_thinking_mode", body.review_thinking_mode)
+    else:
+        _app_db.set_setting("review_thinking_mode", "")
     _app_db.mark_setup_complete()
     return {"ok": True}
 
