@@ -413,7 +413,9 @@ class LLMProvider:
                 logger.info("Model %s rejected forced tool_choice; retrying with auto", api_model)
                 self._no_forced_tool_choice.add(api_model)
                 body["tool_choice"] = "auto"
-            elif "response_format" in body and "response format" in text:
+            elif "response_format" in body and (
+                "response_format" in text or "response format" in text
+            ):
                 logger.info(
                     "Model %s rejected response_format=json_object; retrying without it", api_model
                 )
@@ -425,7 +427,11 @@ class LLMProvider:
                 body.pop("reasoning", None)
                 # reasoning had suppressed temperature; restore it unless the
                 # model also rejects temperature.
-                if temperature is not None and api_model not in self._no_temperature:
+                if (
+                    self.config.send_temperature
+                    and temperature is not None
+                    and api_model not in self._no_temperature
+                ):
                     body["temperature"] = temperature
             elif "temperature" in body and "temperature" in text:
                 logger.info("Model %s rejected temperature; retrying without it", api_model)
@@ -458,7 +464,7 @@ class LLMProvider:
             "messages": messages,
             "max_tokens": max_tokens if max_tokens is not None else self.config.max_tokens,
         }
-        if api_model not in self._no_temperature:
+        if self.config.send_temperature and api_model not in self._no_temperature:
             body["temperature"] = temp
         if json_mode and api_model not in self._no_response_format:
             body["response_format"] = {"type": "json_object"}
@@ -512,7 +518,7 @@ class LLMProvider:
             "tool_choice": "auto" if api_model in self._no_forced_tool_choice else forced_choice,
             "max_tokens": self.config.max_tokens,
         }
-        if api_model not in self._no_temperature:
+        if self.config.send_temperature and api_model not in self._no_temperature:
             body["temperature"] = temp
         self._apply_reasoning(body)
 
@@ -620,7 +626,7 @@ class LLMProvider:
             "tool_choice": "auto",
             "max_tokens": self.config.max_tokens,
         }
-        if api_model not in self._no_temperature:
+        if self.config.send_temperature and api_model not in self._no_temperature:
             body["temperature"] = temp
         self._apply_reasoning(body)
 
