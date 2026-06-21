@@ -117,8 +117,10 @@ _SKIP_PATTERNS = [
 _FILE_FETCH_SEMAPHORE = 10
 # Concurrent LLM summarization batches per repo. The indexing model
 # typically handles 6-8 comfortably on OpenRouter; bumping from 3 nearly
-# halves file-phase wall time without changing quality.
-_LLM_SEMAPHORE = 8
+# halves file-phase wall time without changing quality. Env-overridable so
+# deployments against rate-limited gateways (e.g. Databricks FMAPI
+# output-tokens-per-minute tiers) can throttle indexing to avoid 429 storms.
+_LLM_SEMAPHORE = int(os.environ.get("MIRA_INDEX_LLM_CONCURRENCY") or 8)
 # Smaller batches → faster individual calls → better wave parallelism.
 # Empirically a 5-file batch with one large file bloated to 7k output
 # tokens and took 87s, dominating an entire indexing run. With 3-file
